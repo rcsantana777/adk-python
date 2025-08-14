@@ -17,11 +17,8 @@
 from __future__ import annotations
 
 import asyncio
-from typing import Any
 from typing import AsyncGenerator
 from typing import ClassVar
-from typing import Dict
-from typing import Type
 
 from typing_extensions import override
 
@@ -63,30 +60,54 @@ async def _merge_agent_run(
   Yields:
       Event: The next event from the merged generator.
   """
-  tasks = [
-      asyncio.create_task(events_for_one_agent.__anext__())
-      for events_for_one_agent in agent_runs
-  ]
-  pending_tasks = set(tasks)
+  sentinel = object()
+  queue = asyncio.Queue()
 
-  while pending_tasks:
-    done, pending_tasks = await asyncio.wait(
-        pending_tasks, return_when=asyncio.FIRST_COMPLETED
-    )
-    for task in done:
-      try:
-        yield task.result()
+  # TODO - replace propagate_exceptions with asyncio.TaskGroup once Python 3.9
+  # is no longer supported.
+  def propagate_exceptions(tasks):
+    # Propagate exceptions and errors from tasks.
+    for task in tasks:
+      if task.done():
+        # Ignore the result (None) of correctly finished tasks and re-raise
+        # exceptions and errors.
+        task.result()
 
-        # Find the generator that produced this event and move it on.
-        for i, original_task in enumerate(tasks):
-          if task == original_task:
-            new_task = asyncio.create_task(agent_runs[i].__anext__())
-            tasks[i] = new_task
-            pending_tasks.add(new_task)
-            break  # stop iterating once found
+  # Agents are processed in parallel.
+  # Events for each agent are put on queue sequentially.
+  async def process_an_agent(events_for_one_agent):
+    try:
+      async for event in events_for_one_agent:
+        resume_signal = asyncio.Event()
+        await queue.put((event, resume_signal))
+        # Wait for upstream to consume event before generating new events.
+        await resume_signal.wait()
+    finally:
+      # Mark agent as finished.
+      await queue.put((sentinel, None))
 
-      except StopAsyncIteration:
-        continue
+  tasks = []
+  try:
+    for events_for_one_agent in agent_runs:
+      tasks.append(asyncio.create_task(process_an_agent(events_for_one_agent)))
+
+    sentinel_count = 0
+    # Run until all agents finished processing.
+    while sentinel_count < len(agent_runs):
+      propagate_exceptions(tasks)
+      event, resume_signal = await queue.get()
+      # Agent finished processing.
+      if event is sentinel:
+        sentinel_count += 1
+      else:
+        yield event
+        # Signal to agent that it should generate next event.
+        resume_signal.set()
+  finally:
+    # TODO - replace manual cancellations with asyncio.TaskGroup once Python
+    # 3.9 is no longer supported.
+    for task in tasks:
+      task.cancel()
 
 
 class ParallelAgent(BaseAgent):
@@ -112,10 +133,13 @@ class ParallelAgent(BaseAgent):
         )
         for sub_agent in self.sub_agents
     ]
-
-    async with Aclosing(_merge_agent_run(agent_runs)) as agen:
-      async for event in agen:
-        yield event
+    try:
+      async with Aclosing(_merge_agent_run(agent_runs)) as agen:
+        async for event in agen:
+          yield event
+    finally:
+      for sub_agent_run in agent_runs:
+        await sub_agent_run.aclose()
 
   @override
   async def _run_live_impl(
